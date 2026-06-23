@@ -38,12 +38,12 @@ impl Loader for TextLoader {
             source,
         })?;
 
-        let content = std::str::from_utf8(&bytes)
-            .map_err(|source| RagError::InvalidUtf8 {
-                path: path.to_path_buf(),
-                source,
-            })?
-            .to_owned();
+        // `String::from_utf8` validates in place and reuses the buffer on success,
+        // avoiding a second full copy of the file contents.
+        let content = String::from_utf8(bytes).map_err(|err| RagError::InvalidUtf8 {
+            path: path.to_path_buf(),
+            source: err.utf8_error(),
+        })?;
 
         let mut document = Document::new(path.to_string_lossy().into_owned(), content)
             .with_metadata("loader", "text");

@@ -140,10 +140,26 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     entries.sort();
 
     for path in entries {
-        if path.is_dir() {
+        // Inspect the entry itself via `symlink_metadata` rather than `is_dir`, which
+        // follows symlinks. Recursing into a symlinked directory could loop forever on
+        // a cyclic link (e.g. one pointing back at a parent) and overflow the stack.
+        let metadata = std::fs::symlink_metadata(&path).map_err(|source| RagError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if metadata.is_dir() {
             collect_files(&path, out)?;
-        } else {
+        } else if metadata.is_file() {
             out.push(path);
+        } else if metadata.is_symlink() {
+            // Follow symlinks that resolve to regular files, but never recurse into a
+            // symlinked directory.
+            if std::fs::metadata(&path)
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
+                out.push(path);
+            }
         }
     }
     Ok(())
@@ -250,5 +266,30 @@ mod tests {
         let mut pipeline = IngestionPipeline::builder(InMemoryStorage::new()).build();
         let err = pipeline.ingest_path(&path).unwrap_err();
         assert!(matches!(err, RagError::UnsupportedFormat { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_walk_handles_symlinks_without_cycling() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "real document body here").unwrap();
+
+        // A symlink to a regular file is still ingested.
+        std::fs::write(dir.path().join("target.txt"), "link target body here").unwrap();
+        symlink(dir.path().join("target.txt"), dir.path().join("link.txt")).unwrap();
+
+        // A circular directory symlink (sub/loop -> the root) must not be followed,
+        // otherwise the recursive walk would loop forever and overflow the stack.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        symlink(dir.path(), sub.join("loop")).unwrap();
+
+        let mut pipeline = IngestionPipeline::builder(InMemoryStorage::new()).build();
+        let report = pipeline.ingest_path(dir.path()).unwrap(); // terminates
+
+        // a.txt, link.txt, target.txt — the symlinked directory is skipped.
+        assert_eq!(report.files_ingested, 3);
     }
 }

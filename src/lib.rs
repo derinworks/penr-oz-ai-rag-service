@@ -17,6 +17,10 @@
 //!
 //! [`IngestionPipeline`] composes the three stages.
 //!
+//! Embedding chunks for retrieval is handled separately, behind the
+//! [`EmbeddingProvider`] trait, so the embedding backend can be chosen independently of
+//! how documents are loaded, chunked, and stored.
+//!
 //! ## Example
 //!
 //! ```
@@ -32,6 +36,7 @@
 
 pub mod chunker;
 pub mod document;
+pub mod embedding;
 pub mod error;
 pub mod loader;
 pub mod pipeline;
@@ -39,6 +44,7 @@ pub mod storage;
 
 pub use chunker::{Chunker, FixedSizeChunker};
 pub use document::{Chunk, ChunkMetadata, Document, Metadata};
+pub use embedding::{EmbeddingError, EmbeddingProvider, MockEmbeddingProvider};
 pub use error::{RagError, Result};
 pub use loader::{Loader, LoaderRegistry, TextLoader};
 pub use pipeline::{FileReport, IngestReport, IngestionPipeline, PipelineBuilder};

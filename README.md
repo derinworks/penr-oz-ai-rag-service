@@ -180,6 +180,33 @@ The same pattern applies to chunking (implement `Chunker`) and storage (implemen
 `ChunkStore`, e.g. to write to a vector database) — each is selected on the
 `IngestionPipeline` builder without changing the other stages.
 
+## Embeddings
+
+Turning chunks into vectors is decoupled from ingestion behind the `EmbeddingProvider`
+trait, so the embedding backend (a hosted API, a local model, …) can be swapped without
+touching the rest of the service. The trait embeds a **batch** at a time, is object-safe
+(usable as `Box<dyn EmbeddingProvider>`), and surfaces a dedicated `EmbeddingError`:
+
+```rust
+use penr_oz_ai_rag_service::{EmbeddingError, EmbeddingProvider, MockEmbeddingProvider};
+
+#[tokio::main]
+async fn main() -> Result<(), EmbeddingError> {
+    // `MockEmbeddingProvider` produces deterministic vectors with no network — handy in
+    // tests and examples. Swap in a real provider behind the same trait.
+    let provider = MockEmbeddingProvider::new();
+    let vectors = provider.embed(&["hello", "world"]).await?;
+
+    assert_eq!(vectors.len(), 2);
+    assert_eq!(vectors[0].len(), provider.dimensions());
+    Ok(())
+}
+```
+
+Provider-specific code (HTTP, auth, request shaping) lives inside each implementation, so
+adding a real provider is a matter of implementing `EmbeddingProvider` and returning
+`EmbeddingError` for failures.
+
 ## Project layout
 
 ```
@@ -191,9 +218,11 @@ src/
 ├── loader/           Loader trait, LoaderRegistry, TextLoader
 ├── chunker/          Chunker trait, FixedSizeChunker
 ├── storage/          ChunkStore trait, InMemoryStorage, JsonlStorage
+├── embedding/        EmbeddingProvider trait, EmbeddingError, MockEmbeddingProvider
 └── pipeline.rs       IngestionPipeline + builder
 tests/
-└── ingestion.rs      end-to-end tests
+├── ingestion.rs      end-to-end ingestion tests
+└── embedding.rs      embedding abstraction tests
 ```
 
 ## License

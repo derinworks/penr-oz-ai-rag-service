@@ -256,6 +256,44 @@ async fn main() -> Result<(), VectorStoreError> {
 The first inserted vector fixes the store's dimensionality; later vectors and query
 vectors must match it, or the store returns `VectorStoreError::DimensionMismatch`.
 
+## Retrieval
+
+`Retriever` composes the embedding and vector-store layers into the read half of RAG —
+the engine behind a `POST /retrieve` endpoint. Given a query it **validates** it, embeds
+it with an `EmbeddingProvider`, and searches a `VectorStore`, returning the top matching
+chunks with their similarity scores. Empty (or whitespace-only) and oversized queries are
+rejected with a dedicated `RetrievalError` *before* any embedding or search work happens,
+so bad input never reaches the backend.
+
+```rust
+use penr_oz_ai_rag_service::{
+    Chunk, InMemoryVectorStore, MockEmbeddingProvider, RetrievalError, Retriever,
+};
+
+#[tokio::main]
+async fn main() -> Result<(), RetrievalError> {
+    let retriever = Retriever::new(MockEmbeddingProvider::new(), InMemoryVectorStore::new());
+
+    // `chunks: Vec<Chunk>` comes from the ingestion pipeline. `index` embeds each chunk's
+    // content and adds it to the store, so it becomes retrievable.
+    let chunks: Vec<Chunk> = Vec::new();
+    retriever.index(&chunks).await?;
+
+    // Retrieve the 5 chunks most relevant to a query, each with its similarity score.
+    for hit in retriever.retrieve("how does retrieval work?", 5).await? {
+        println!("{:.3}  {}", hit.score, hit.content());
+    }
+    Ok(())
+}
+```
+
+The `RetrievalRequest` / `RetrievalResponse` pair is the JSON wire shape of the endpoint:
+deserialize the `POST` body into a `RetrievalRequest` (`top_k` defaults to `5` when
+omitted), call `Retriever::handle`, and serialize the `RetrievalResponse` back. No web
+framework is bundled — like the embedding and vector-store layers, retrieval is kept a
+runtime-agnostic library so the binary that hosts the endpoint chooses its own HTTP stack.
+Validation errors map naturally to `400 Bad Request` and backend failures to `5xx`.
+
 ## Project layout
 
 ```
@@ -269,11 +307,13 @@ src/
 ├── storage/          ChunkStore trait, InMemoryStorage, JsonlStorage
 ├── embedding/        EmbeddingProvider trait, EmbeddingError, MockEmbeddingProvider
 ├── vector/           VectorStore trait, VectorStoreError, InMemoryVectorStore
+├── retrieval.rs      Retriever, RetrievalRequest/Response, RetrievalError
 └── pipeline.rs       IngestionPipeline + builder
 tests/
 ├── ingestion.rs      end-to-end ingestion tests
 ├── embedding.rs      embedding abstraction tests
-└── vector_search.rs  end-to-end embed-index-retrieve tests
+├── vector_search.rs  end-to-end embed-index-retrieve tests
+└── retrieval.rs      end-to-end retriever tests (validate, embed, search)
 ```
 
 ## License

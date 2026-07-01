@@ -36,7 +36,7 @@ async fn indexes_then_retrieves_the_matching_chunk() {
     // one chunk's exact words) yields an identical vector — a perfect cosine match — which
     // lets us assert retrieval precisely.
     let indexed = retriever
-        .index(&[
+        .index(vec![
             chunk("c0", "retrieval augmented generation"),
             chunk("c1", "fixed size character chunking"),
             chunk("c2", "cosine similarity vector search"),
@@ -74,7 +74,10 @@ async fn indexes_then_retrieves_the_matching_chunk() {
 async fn handle_returns_the_endpoint_response_shape() {
     let retriever = retriever();
     retriever
-        .index(&[chunk("c0", "hello world"), chunk("c1", "goodbye moon")])
+        .index(vec![
+            chunk("c0", "hello world"),
+            chunk("c1", "goodbye moon"),
+        ])
         .await
         .unwrap();
 

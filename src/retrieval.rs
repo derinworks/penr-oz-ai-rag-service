@@ -43,7 +43,7 @@
 //!
 //! // Index a small corpus, then retrieve the chunks most relevant to a query.
 //! retriever
-//!     .index(&[
+//!     .index(vec![
 //!         chunk("c0", "retrieval augmented generation"),
 //!         chunk("c1", "cosine similarity vector search"),
 //!     ])
@@ -165,13 +165,16 @@ where
     ///
     /// This is the write half that populates the store a later [`retrieve`](Self::retrieve)
     /// searches: each chunk's text is embedded with this retriever's provider and inserted
-    /// alongside the chunk, so dimensions line up by construction. An empty slice is a
+    /// alongside the chunk, so dimensions line up by construction. Chunks are taken by
+    /// value — they are moved into the index rather than cloned. An empty `Vec` is a
     /// no-op.
     ///
     /// # Errors
     /// Returns [`RetrievalError::Embedding`] if the provider fails (e.g. a chunk has empty
-    /// content) and [`RetrievalError::VectorStore`] if the store rejects the batch.
-    pub async fn index(&self, chunks: &[Chunk]) -> Result<usize, RetrievalError> {
+    /// content), [`RetrievalError::EmbeddingCountMismatch`] if the provider returns a
+    /// different number of vectors than chunks it was given, and
+    /// [`RetrievalError::VectorStore`] if the store rejects the batch.
+    pub async fn index(&self, chunks: Vec<Chunk>) -> Result<usize, RetrievalError> {
         if chunks.is_empty() {
             return Ok(0);
         }
@@ -179,9 +182,18 @@ where
         let texts: Vec<&str> = chunks.iter().map(|chunk| chunk.content.as_str()).collect();
         let embeddings = self.embedder.embed(&texts).await?;
 
+        // `zip` would silently drop chunks (or pair them with the wrong vectors) if a
+        // misbehaving provider returned the wrong number of embeddings, so reject that
+        // before anything reaches the store.
+        if embeddings.len() != chunks.len() {
+            return Err(RetrievalError::EmbeddingCountMismatch {
+                expected: chunks.len(),
+                actual: embeddings.len(),
+            });
+        }
+
         let items: Vec<EmbeddedChunk> = chunks
-            .iter()
-            .cloned()
+            .into_iter()
             .zip(embeddings)
             .map(|(chunk, embedding)| EmbeddedChunk::new(chunk, embedding))
             .collect();
@@ -201,6 +213,8 @@ where
     /// - [`RetrievalError::QueryTooLong`] if `query` exceeds
     ///   [`max_query_chars`](Self::max_query_chars).
     /// - [`RetrievalError::Embedding`] if embedding the query fails.
+    /// - [`RetrievalError::EmbeddingCountMismatch`] if the provider returns anything but
+    ///   exactly one vector for the query.
     /// - [`RetrievalError::VectorStore`] if the search fails (e.g. a dimension mismatch
     ///   between the query embedding and the indexed vectors).
     pub async fn retrieve(
@@ -219,13 +233,17 @@ where
             });
         }
 
-        let query_vector = self
-            .embedder
-            .embed(&[query])
-            .await?
+        let embeddings = self.embedder.embed(&[query]).await?;
+        if embeddings.len() != 1 {
+            return Err(RetrievalError::EmbeddingCountMismatch {
+                expected: 1,
+                actual: embeddings.len(),
+            });
+        }
+        let query_vector = embeddings
             .into_iter()
             .next()
-            .ok_or(RetrievalError::MissingEmbedding)?;
+            .expect("length was just checked to be 1");
 
         let results = self.store.search(&query_vector, top_k).await?;
         Ok(results)
@@ -274,10 +292,16 @@ pub enum RetrievalError {
     #[error("vector search failed: {0}")]
     VectorStore(#[from] VectorStoreError),
 
-    /// The embedding provider returned no vector for the query, despite being asked for
-    /// one. A correct provider never does this; it signals a misbehaving backend.
-    #[error("the embedding provider returned no vector for the query")]
-    MissingEmbedding,
+    /// The embedding provider returned a different number of vectors than inputs it was
+    /// given. A correct provider never does this; it signals a misbehaving backend, and
+    /// pairing chunks with the wrong vectors would silently corrupt the index.
+    #[error("the embedding provider returned {actual} vector(s) for {expected} input(s)")]
+    EmbeddingCountMismatch {
+        /// How many vectors were expected (one per input).
+        expected: usize,
+        /// How many vectors the provider actually returned.
+        actual: usize,
+    },
 }
 
 #[cfg(test)]
@@ -351,7 +375,7 @@ mod tests {
     async fn retrieves_ranked_scored_results() {
         let retriever = retriever();
         let indexed = retriever
-            .index(&[
+            .index(vec![
                 chunk("c0", "retrieval augmented generation"),
                 chunk("c1", "fixed size character chunking"),
                 chunk("c2", "cosine similarity vector search"),
@@ -380,7 +404,11 @@ mod tests {
     async fn top_k_caps_results_and_zero_returns_none() {
         let retriever = retriever();
         retriever
-            .index(&[chunk("a", "alpha"), chunk("b", "beta"), chunk("c", "gamma")])
+            .index(vec![
+                chunk("a", "alpha"),
+                chunk("b", "beta"),
+                chunk("c", "gamma"),
+            ])
             .await
             .unwrap();
 
@@ -389,6 +417,55 @@ mod tests {
         assert_eq!(retriever.retrieve("alpha", 99).await.unwrap().len(), 3);
         // k == 0 returns nothing, without error.
         assert!(retriever.retrieve("alpha", 0).await.unwrap().is_empty());
+    }
+
+    /// A provider that violates the [`EmbeddingProvider`] contract by returning a fixed
+    /// number of vectors regardless of how many inputs it was given, to exercise the
+    /// count-mismatch guard.
+    struct MiscountingProvider {
+        count: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for MiscountingProvider {
+        async fn embed(&self, _inputs: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+            Ok(vec![vec![1.0, 0.0]; self.count])
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
+    }
+
+    #[tokio::test]
+    async fn index_rejects_a_provider_that_miscounts_embeddings() {
+        let retriever =
+            Retriever::new(MiscountingProvider { count: 1 }, InMemoryVectorStore::new());
+        match retriever
+            .index(vec![chunk("a", "alpha"), chunk("b", "beta")])
+            .await
+        {
+            Err(RetrievalError::EmbeddingCountMismatch { expected, actual }) => {
+                assert_eq!(expected, 2);
+                assert_eq!(actual, 1);
+            }
+            other => panic!("expected EmbeddingCountMismatch, got {other:?}"),
+        }
+        // Nothing reached the store.
+        assert_eq!(retriever.store().len().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn retrieve_rejects_a_provider_that_returns_no_vector() {
+        let retriever =
+            Retriever::new(MiscountingProvider { count: 0 }, InMemoryVectorStore::new());
+        match retriever.retrieve("a valid query", 5).await {
+            Err(RetrievalError::EmbeddingCountMismatch { expected, actual }) => {
+                assert_eq!(expected, 1);
+                assert_eq!(actual, 0);
+            }
+            other => panic!("expected EmbeddingCountMismatch, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -409,7 +486,10 @@ mod tests {
     async fn handle_maps_request_to_response() {
         let retriever = retriever();
         retriever
-            .index(&[chunk("c0", "hello world"), chunk("c1", "goodbye moon")])
+            .index(vec![
+                chunk("c0", "hello world"),
+                chunk("c1", "goodbye moon"),
+            ])
             .await
             .unwrap();
 

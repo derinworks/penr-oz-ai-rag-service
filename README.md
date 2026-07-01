@@ -275,9 +275,9 @@ async fn main() -> Result<(), RetrievalError> {
     let retriever = Retriever::new(MockEmbeddingProvider::new(), InMemoryVectorStore::new());
 
     // `chunks: Vec<Chunk>` comes from the ingestion pipeline. `index` embeds each chunk's
-    // content and adds it to the store, so it becomes retrievable.
+    // content and moves it into the store, so it becomes retrievable without a clone.
     let chunks: Vec<Chunk> = Vec::new();
-    retriever.index(&chunks).await?;
+    retriever.index(chunks).await?;
 
     // Retrieve the 5 chunks most relevant to a query, each with its similarity score.
     for hit in retriever.retrieve("how does retrieval work?", 5).await? {

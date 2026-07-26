@@ -32,7 +32,7 @@ wire formats, and extension examples.
 | `src/llm/` | `LlmProvider` trait, `LlmError`, `MockLlmProvider` |
 | `src/generation.rs` | `AnswerGenerator` (retrieve → gate → prompt → answer), `build_prompt` |
 | `src/pipeline.rs` | `IngestionPipeline` + `PipelineBuilder` |
-| `tests/` | One integration file per stage: `ingestion`, `embedding`, `vector_search`, `retrieval`, `generation`, `serve` (HTTP end-to-end) |
+| `tests/` | One integration file per stage: `ingestion`, `embedding`, `vector_search`, `retrieval`, `generation`, `serve` (HTTP end-to-end); plus `rag_flow` (cross-stage: ingest → retrieve → answer) |
 
 ## Commands
 

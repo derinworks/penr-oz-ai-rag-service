@@ -35,6 +35,21 @@ fn ingest(
     chunks
 }
 
+/// Isolate the numbered context passages of a prompt built by `build_prompt` — the
+/// span between the `Context:` header and the trailing `Question:` line.
+///
+/// Grounding assertions run against this section rather than the whole prompt so they
+/// cannot be satisfied by the question that `build_prompt` always appends.
+fn context_section(prompt: &str) -> &str {
+    const HEADER: &str = "Context:\n";
+    let start = prompt.find(HEADER).expect("prompt has a context section") + HEADER.len();
+    let end = start
+        + prompt[start..]
+            .find("Question:")
+            .expect("prompt has a question line");
+    &prompt[start..end]
+}
+
 #[tokio::test]
 async fn ingested_documents_flow_through_retrieval_to_a_grounded_answer() {
     // Two small documents, each shorter than the 64-character chunk size, so each
@@ -98,9 +113,19 @@ async fn ingested_documents_flow_through_retrieval_to_a_grounded_answer() {
         .await
         .expect("generation succeeds");
 
-    assert!(response
-        .answer
-        .contains("retrieval augmented generation grounds answers"));
+    // Assert the passage reached the model's *context*, not merely that its words
+    // appear somewhere in the prompt: the query here is the document's exact text, so
+    // a bare `contains` would also be satisfied by the trailing question line and would
+    // stay green even if `build_prompt` stopped including retrieved passages entirely.
+    let context = context_section(&response.answer);
+    assert!(
+        context.contains("retrieval augmented generation grounds answers"),
+        "retrieved passage missing from the prompt's context section: {context:?}"
+    );
+    assert!(
+        context.contains(&format!("[1] {retrieved_id}")),
+        "retrieved chunk not cited as context passage 1: {context:?}"
+    );
     assert!(response.answer.contains(&format!("Question: {query}")));
     assert_eq!(response.sources.len(), 1);
     assert_eq!(response.sources[0].id, retrieved_id);

@@ -21,6 +21,7 @@ wire formats, and extension examples.
 | --- | --- |
 | `src/lib.rs` | Crate root; re-exports the entire public API |
 | `src/main.rs` | `penr-oz-rag` CLI (clap): `ingest` + `serve`, axum handlers |
+| `src/config.rs` | `Config` (defaults + JSON file + `RAG_*` env), `ConfigError`, backend kinds |
 | `src/error.rs` | `RagError` / `Result` for the ingestion side |
 | `src/document.rs` | `Document`, `Chunk`, `ChunkMetadata`, `Metadata` |
 | `src/loader/` | `Loader` trait, `LoaderRegistry`, `TextLoader` (`.txt`/`.text` only) |
@@ -32,7 +33,7 @@ wire formats, and extension examples.
 | `src/llm/` | `LlmProvider` trait, `LlmError`, `MockLlmProvider` |
 | `src/generation.rs` | `AnswerGenerator` (retrieve → gate → prompt → answer), `build_prompt` |
 | `src/pipeline.rs` | `IngestionPipeline` + `PipelineBuilder` |
-| `tests/` | One integration file per stage: `ingestion`, `embedding`, `vector_search`, `retrieval`, `generation`, `serve` (HTTP end-to-end); plus `rag_flow` (cross-stage: ingest → retrieve → answer) |
+| `tests/` | One integration file per stage: `ingestion`, `embedding`, `vector_search`, `retrieval`, `generation`, `serve` (HTTP end-to-end); plus `rag_flow` (cross-stage: ingest → retrieve → answer) and `config` (file layer + binary startup) |
 
 ## Commands
 
@@ -51,7 +52,7 @@ test — run all four locally before pushing.
 
 ```bash
 penr-oz-rag ingest <INPUT> [-o out.jsonl] [--chunk-size 800] [--overlap 100] [--no-word-aware]
-penr-oz-rag serve  <INPUT> [--addr 127.0.0.1:8080] [--min-score 0]
+penr-oz-rag serve  <INPUT> [--config rag.config.json] [--addr 127.0.0.1:8080] [--min-score 0]
 ```
 
 ## Conventions
@@ -84,6 +85,17 @@ penr-oz-rag serve  <INPUT> [--addr 127.0.0.1:8080] [--min-score 0]
 - Defaults live in code: `DEFAULT_TOP_K = 5`, `DEFAULT_MAX_QUERY_CHARS = 8192`,
   `DEFAULT_MIN_SCORE = 0.0`. Empty/whitespace or oversized queries are rejected with
   `400` before any embedding or search work happens.
+- `serve` config layers, lowest to highest: defaults → JSON file (`--config`, else
+  `$RAG_CONFIG`, else `./rag.config.json` if present) → `RAG_*` env → CLI flags. CLI
+  overrides are folded into the `Config` before a single `validate()` call, so startup
+  fails before ingesting or binding. A file named explicitly must exist; the implicit
+  one need not.
+- `Config` uses `#[serde(default, deny_unknown_fields)]`, so omitted keys fall back to
+  defaults and a typo is an error rather than a silent no-op. Test env handling through
+  `apply_env_with`, never `apply_env` — the process environment is shared across
+  concurrently running tests.
+- There is deliberately no `retrieval.top_k` setting: `top_k` is per request. And
+  `logging.*` is parsed and validated but not yet wired to a subscriber.
 - HTTP error mapping in `serve`: validation → `400`, embedding/LLM backend failure →
   `502`, vector-store failure → `500`.
 - Ingesting a **directory** silently skips (and counts) files with no registered

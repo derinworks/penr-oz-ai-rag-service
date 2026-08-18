@@ -24,6 +24,11 @@
 //! matching [`Chunk`] with its score — backed by an in-process [`InMemoryVectorStore`]
 //! for development and tests.
 //!
+//! Which backend each of those stages uses, where the server listens, and how much it
+//! logs are answered by [`Config`], assembled from defaults, an optional JSON file, and
+//! `RAG_`-prefixed environment variables, and validated at startup so a misconfigured
+//! service fails immediately rather than on its first request.
+//!
 //! A [`Retriever`] composes those two abstractions into the read half of RAG: it
 //! validates a query, embeds it, and searches the vector store, returning the top
 //! matching chunks with their scores. It is the engine behind a `POST /retrieve`
@@ -52,6 +57,7 @@
 //! ```
 
 pub mod chunker;
+pub mod config;
 pub mod document;
 pub mod embedding;
 pub mod error;
@@ -64,6 +70,11 @@ pub mod storage;
 pub mod vector;
 
 pub use chunker::{Chunker, FixedSizeChunker};
+pub use config::{
+    Config, ConfigError, EmbeddingConfig, EmbeddingProviderKind, LlmConfig, LlmProviderKind,
+    LogFormat, LogLevel, LoggingConfig, RetrievalConfig, ServerConfig, VectorStoreConfig,
+    VectorStoreKind, CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH,
+};
 pub use document::{Chunk, ChunkMetadata, Document, Metadata};
 pub use embedding::{EmbeddingError, EmbeddingProvider, MockEmbeddingProvider};
 pub use error::{RagError, Result};

@@ -24,9 +24,10 @@ use axum::{Json, Router};
 use clap::{Args, Parser, Subcommand};
 
 use penr_oz_ai_rag_service::{
-    AnswerGenerator, AnswerRequest, ChunkStore, FixedSizeChunker, GenerationError, InMemoryStorage,
-    InMemoryVectorStore, IngestReport, IngestionPipeline, JsonlStorage, MockEmbeddingProvider,
-    MockLlmProvider, Result, RetrievalError, RetrievalRequest, Retriever, DEFAULT_MIN_SCORE,
+    AnswerGenerator, AnswerRequest, ChunkStore, Config, EmbeddingProviderKind, FixedSizeChunker,
+    GenerationError, InMemoryStorage, InMemoryVectorStore, IngestReport, IngestionPipeline,
+    JsonlStorage, LlmProviderKind, MockEmbeddingProvider, MockLlmProvider, Result, RetrievalError,
+    RetrievalRequest, Retriever, VectorStoreKind,
 };
 
 /// The answer generator the `serve` command hosts — wrapping the retriever it also
@@ -84,9 +85,15 @@ struct ServeArgs {
     /// Path to a file or directory to ingest and serve retrieval over.
     input: PathBuf,
 
-    /// Address to bind the HTTP server to. Use port 0 to pick a free port.
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    addr: SocketAddr,
+    /// Path to a JSON config file. Defaults to $RAG_CONFIG, then ./rag.config.json when
+    /// it exists; otherwise built-in defaults are used.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Address to bind the HTTP server to. Use port 0 to pick a free port. Overrides
+    /// `server.host` and `server.port` from the config.
+    #[arg(long)]
+    addr: Option<SocketAddr>,
 
     /// Maximum number of characters per chunk.
     #[arg(long, default_value_t = 800)]
@@ -101,9 +108,10 @@ struct ServeArgs {
     no_word_aware: bool,
 
     /// Minimum similarity score a retrieved chunk must reach to be used as answer
-    /// context. Requests can override it per call via `min_score`.
-    #[arg(long, default_value_t = DEFAULT_MIN_SCORE)]
-    min_score: f32,
+    /// context. Requests can override it per call via `min_score`. Overrides
+    /// `retrieval.min_score` from the config.
+    #[arg(long)]
+    min_score: Option<f32>,
 }
 
 fn main() -> ExitCode {
@@ -147,30 +155,60 @@ fn ingest(args: IngestArgs) -> Result<()> {
 }
 
 /// Ingest `input` into memory, index every chunk, and serve `POST /retrieve` and
-/// `POST /answer` on `args.addr` until interrupted.
+/// `POST /answer` on the configured address until interrupted.
+///
+/// Configuration is resolved before any work happens — defaults, then the config file,
+/// then `RAG_*` environment variables, then the command-line flags below, which are the
+/// most specific statement of intent and so win. The result is validated once, so a
+/// misconfigured service fails here rather than on its first request.
 fn serve(args: ServeArgs) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut config = Config::load(args.config.as_deref())?;
+    // Fold the CLI overrides into the config so one validation covers every layer.
+    if let Some(addr) = args.addr {
+        config.server.host = addr.ip().to_string();
+        config.server.port = addr.port();
+    }
+    if let Some(min_score) = args.min_score {
+        config.retrieval.min_score = min_score;
+    }
+    config.validate()?;
+
     let chunker =
         FixedSizeChunker::new(args.chunk_size, args.overlap)?.word_aware(!args.no_word_aware);
     let (report, store) = run_pipeline(InMemoryStorage::new(), chunker, &args.input, None)?;
     print_report(&report);
+    print_config(&config);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let retriever = Retriever::new(MockEmbeddingProvider::new(), InMemoryVectorStore::new());
+        // Each `match` is exhaustive over its kind, so adding a real provider fails to
+        // compile here — at the one place that has to learn how to build it.
+        let embedder = match config.embedding.provider {
+            EmbeddingProviderKind::Mock => MockEmbeddingProvider::new(),
+        };
+        let vector_store = match config.vector_store.kind {
+            VectorStoreKind::InMemory => InMemoryVectorStore::new(),
+        };
+        let llm = match config.llm.provider {
+            LlmProviderKind::Mock => MockLlmProvider::new(),
+        };
+
+        let retriever = Retriever::new(embedder, vector_store)
+            .with_max_query_chars(config.retrieval.max_query_chars);
         let indexed = retriever.index(store.into_chunks()).await?;
         println!("Indexed {indexed} chunk(s) for retrieval.");
 
         let generator =
-            AnswerGenerator::new(retriever, MockLlmProvider::new()).with_min_score(args.min_score);
+            AnswerGenerator::new(retriever, llm).with_min_score(config.retrieval.min_score);
 
         let app = Router::new()
             .route("/retrieve", post(retrieve_handler))
             .route("/answer", post(answer_handler))
             .with_state(Arc::new(generator));
 
-        let listener = tokio::net::TcpListener::bind(args.addr).await?;
+        let listener = tokio::net::TcpListener::bind(config.addr()?).await?;
         // Report the *bound* address, which differs from the requested one when the
         // caller asked for port 0. Keep this a single line, printed last: readers
         // (like the integration tests) treat it as the readiness signal and may stop
@@ -248,6 +286,21 @@ fn run_pipeline<S: ChunkStore>(
     let report = pipeline.ingest_path(input)?;
     pipeline.flush()?;
     Ok((report, pipeline.into_store()))
+}
+
+/// Report the settings that were actually resolved, so a surprising run can be traced to
+/// the layer that caused it without re-deriving the precedence by hand.
+fn print_config(config: &Config) {
+    println!(
+        "Config: embedding={}, llm={}, vector_store={}, min_score={}, max_query_chars={}, log={}/{}",
+        config.embedding.provider,
+        config.llm.provider,
+        config.vector_store.kind,
+        config.retrieval.min_score,
+        config.retrieval.max_query_chars,
+        config.logging.level,
+        config.logging.format,
+    );
 }
 
 fn print_report(report: &IngestReport) {

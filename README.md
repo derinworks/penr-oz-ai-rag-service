@@ -91,7 +91,7 @@ Options common to both commands:
 | Option | Default | Description |
 | --- | --- | --- |
 | `--config <PATH>` | `$RAG_CONFIG`, then `./rag.config.json` | JSON config file. See [Configuration](#configuration). |
-| `--addr <ADDR>` | `server.host`/`server.port` from config (`127.0.0.1:8080`) | Address to bind the HTTP server to (port `0` picks a free port). |
+| `--addr <ADDR>` | `server.host`/`server.port` from config (`127.0.0.1:8080`) | Address to bind the HTTP server to (port `0` picks a free port; an IPv6 zone, as in `[fe80::1%3]:8080`, is kept). |
 | `--min-score <F>` | `retrieval.min_score` from config (`0`) | Minimum similarity score a retrieved chunk must reach to be used as answer context. Requests can override it per call via `min_score`. |
 
 ### Examples
@@ -132,12 +132,13 @@ error.
    as unset.
 4. **Command-line flags** — the most specific statement of intent, so they win.
 
-The resolved result is validated once, before ingesting or binding anything, so a
-mistake surfaces at startup rather than on the first request.
+The resolved result is validated once — after the flags are folded in, before ingesting
+or binding anything — so a mistake surfaces at startup rather than on the first request,
+and a flag can still rescue a value the file or environment got wrong.
 
 | Config key | Environment variable | Default | Accepted values |
 | --- | --- | --- | --- |
-| `server.host` | `RAG_SERVER_HOST` | `127.0.0.1` | Any IP address (`0.0.0.0`, `::1`, …). |
+| `server.host` | `RAG_SERVER_HOST` | `127.0.0.1` | Any IP address (`0.0.0.0`, `::1`, …); an IPv6 host may carry a numeric zone id, as in `fe80::1%3`. |
 | `server.port` | `RAG_SERVER_PORT` | `8080` | `0`–`65535`; `0` picks a free port. |
 | `embedding.provider` | `RAG_EMBEDDING_PROVIDER` | `mock` | `mock` |
 | `llm.provider` | `RAG_LLM_PROVIDER` | `mock` | `mock` |
@@ -206,6 +207,21 @@ fn main() -> Result<(), ConfigError> {
     // Defaults -> file -> environment, then validated.
     let config = Config::load(None)?;
     println!("binding {}", config.addr()?);
+    Ok(())
+}
+```
+
+With overrides of your own to fold in, load the lower layers unvalidated, apply them, and
+validate once — the order `serve` itself uses, and what makes overrides win over an
+invalid file or environment value:
+
+```rust
+use penr_oz_ai_rag_service::{Config, ConfigError};
+
+fn main() -> Result<(), ConfigError> {
+    let mut config = Config::load_unvalidated(None)?;
+    config.retrieval.min_score = 0.25; // whatever the command line said
+    config.validate()?;
     Ok(())
 }
 ```

@@ -90,8 +90,9 @@ struct ServeArgs {
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
-    /// Address to bind the HTTP server to. Use port 0 to pick a free port. Overrides
-    /// `server.host` and `server.port` from the config.
+    /// Address to bind the HTTP server to. Use port 0 to pick a free port. An IPv6
+    /// address may name its zone, as in `[fe80::1%3]:8080`. Overrides `server.host` and
+    /// `server.port` from the config.
     #[arg(long)]
     addr: Option<SocketAddr>,
 
@@ -159,13 +160,15 @@ fn ingest(args: IngestArgs) -> Result<()> {
 ///
 /// Configuration is resolved before any work happens — defaults, then the config file,
 /// then `RAG_*` environment variables, then the command-line flags below, which are the
-/// most specific statement of intent and so win. The result is validated once, so a
-/// misconfigured service fails here rather than on its first request.
+/// most specific statement of intent and so win. The lower layers are loaded *without*
+/// validation so a flag can still rescue a value the file or environment got wrong; the
+/// fully resolved result is then validated once, so a misconfigured service fails here
+/// rather than on its first request.
 fn serve(args: ServeArgs) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut config = Config::load(args.config.as_deref())?;
+    let mut config = Config::load_unvalidated(args.config.as_deref())?;
     // Fold the CLI overrides into the config so one validation covers every layer.
     if let Some(addr) = args.addr {
-        config.server.host = addr.ip().to_string();
+        config.server.host = host_setting(&addr);
         config.server.port = addr.port();
     }
     if let Some(min_score) = args.min_score {
@@ -218,6 +221,22 @@ fn serve(args: ServeArgs) -> std::result::Result<(), Box<dyn std::error::Error>>
         axum::serve(listener, app).await?;
         Ok(())
     })
+}
+
+/// Render `addr`'s IP as a `server.host` setting, keeping an IPv6 zone (scope) id.
+///
+/// `SocketAddr::ip` returns a bare `IpAddr`, which drops the zone a link-local address
+/// such as `[fe80::1%3]:8080` carries — rebuilding the address from host and port would
+/// then bind scope `0` instead of the interface the caller named, and the bind can fail
+/// outright. `Config::addr` parses `[host]:port` as a whole, so keeping the `%<zone>`
+/// suffix in the host is enough to carry it back into the bound address.
+fn host_setting(addr: &SocketAddr) -> String {
+    match addr {
+        SocketAddr::V6(addr) if addr.scope_id() != 0 => {
+            format!("{}%{}", addr.ip(), addr.scope_id())
+        }
+        _ => addr.ip().to_string(),
+    }
 }
 
 /// The `POST /retrieve` handler: deserialize a [`RetrievalRequest`], run it through the
@@ -310,5 +329,40 @@ fn print_report(report: &IngestReport) {
     );
     for file in &report.files {
         println!("  {} -> {} chunk(s)", file.path.display(), file.chunks);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Apply an `--addr` flag the way [`serve`] does, and read the address back out.
+    fn addr_after_override(flag: &str) -> SocketAddr {
+        let requested: SocketAddr = flag.parse().expect("a parseable address");
+        let mut config = Config::default();
+        config.server.host = host_setting(&requested);
+        config.server.port = requested.port();
+        config.validate().expect("an address flag is valid config");
+        config.addr().expect("the override rebuilds an address")
+    }
+
+    #[test]
+    fn an_addr_flag_keeps_an_ipv6_zone_id() {
+        let addr = addr_after_override("[fe80::1%3]:8080");
+
+        match addr {
+            SocketAddr::V6(addr) => assert_eq!(addr.scope_id(), 3, "the zone id survives"),
+            other => panic!("expected an IPv6 address, got {other}"),
+        }
+        assert_eq!(addr.to_string(), "[fe80::1%3]:8080");
+    }
+
+    #[test]
+    fn an_addr_flag_without_a_zone_is_unchanged() {
+        assert_eq!(
+            addr_after_override("127.0.0.1:9100").to_string(),
+            "127.0.0.1:9100"
+        );
+        assert_eq!(addr_after_override("[::1]:9100").to_string(), "[::1]:9100");
     }
 }

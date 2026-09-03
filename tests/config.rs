@@ -148,6 +148,34 @@ fn layers_apply_in_order_with_env_over_file() {
     assert_eq!(config.server.host, "127.0.0.1", "defaults fill the rest");
 }
 
+#[test]
+fn load_leaves_validation_to_the_caller_so_a_flag_can_still_rescue_a_bad_value() {
+    let dir = tempdir().unwrap();
+    // Out of the cosine range, so the file layer on its own is unusable.
+    let path = write_config(dir.path(), r#"{"retrieval": {"min_score": 5.0}}"#);
+
+    let message = Config::load(Some(&path)).unwrap_err().to_string();
+    assert!(message.contains("between -1 and 1"), "{message}");
+
+    let mut config = Config::load_unvalidated(Some(&path)).expect("the layers still load");
+    assert_eq!(config.retrieval.min_score, 5.0);
+    // What `--min-score 0.5` does.
+    config.retrieval.min_score = 0.5;
+    config.validate().expect("the flag made it valid");
+}
+
+#[test]
+fn load_unvalidated_still_reports_a_file_it_cannot_read() {
+    let dir = tempdir().unwrap();
+    let missing = dir.path().join("absent.json");
+
+    let message = Config::load_unvalidated(Some(&missing))
+        .unwrap_err()
+        .to_string();
+
+    assert!(message.contains("failed to read config file"), "{message}");
+}
+
 // --- the binary booting on what the layers resolved to -------------------------------
 
 /// Spawn `penr-oz-rag serve` with `args` and `envs`, returning the process and the lines
@@ -299,6 +327,67 @@ fn an_invalid_setting_stops_startup_with_an_informative_error() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("Serving POST"), "{stdout}");
     assert!(!stdout.contains("Ingested"), "{stdout}");
+}
+
+#[test]
+fn a_flag_rescues_a_value_the_file_layer_got_wrong() {
+    let dir = tempdir().unwrap();
+    let corpus = write_corpus(dir.path());
+    // `min_score` is out of range in the file; the flag replaces it with a usable value,
+    // and flags win — so this must start rather than fail validation on the file.
+    let config = write_config(
+        dir.path(),
+        r#"{"server": {"port": 0}, "retrieval": {"min_score": 5.0}}"#,
+    );
+
+    let (_guard, lines) = spawn_serve(
+        &[
+            corpus.as_os_str(),
+            "--config".as_ref(),
+            config.as_os_str(),
+            "--min-score".as_ref(),
+            "0.5".as_ref(),
+        ],
+        &[],
+    );
+
+    let reported = lines
+        .iter()
+        .find(|line| line.starts_with("Config:"))
+        .expect("server reports its resolved config");
+    assert!(reported.contains("min_score=0.5"), "{reported}");
+    assert!(
+        lines.iter().any(|line| line.starts_with("Serving POST")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn a_flag_that_does_not_fix_the_bad_value_still_stops_startup() {
+    let dir = tempdir().unwrap();
+    let corpus = write_corpus(dir.path());
+    let config = write_config(
+        dir.path(),
+        r#"{"server": {"port": 0}, "retrieval": {"min_score": 5.0}}"#,
+    );
+
+    // A flag is present, but not one that touches the offending setting.
+    let output = Command::new(env!("CARGO_BIN_EXE_penr-oz-rag"))
+        .arg("serve")
+        .arg(&corpus)
+        .arg("--config")
+        .arg(&config)
+        .arg("--addr")
+        .arg("127.0.0.1:0")
+        .output()
+        .expect("serve binary runs");
+
+    assert!(!output.status.success(), "startup should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid configuration"), "{stderr}");
+    assert!(stderr.contains("min_score"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("Serving POST"), "{stdout}");
 }
 
 #[test]

@@ -16,10 +16,14 @@
 //! Command-line flags, where the binary offers them, sit above all three: they are the
 //! most specific statement of intent, so they win.
 //!
-//! [`Config::validate`] is the startup gate. It is called by [`Config::load`] and should
-//! be called again after applying any CLI overrides, so that a misconfigured service
-//! fails immediately with a message naming the offending setting — rather than binding a
-//! port and failing on the first request.
+//! [`Config::validate`] is the startup gate: a misconfigured service fails immediately
+//! with a message naming the offending setting, rather than binding a port and failing on
+//! the first request. It runs *once*, over the fully resolved config. A binary with CLI
+//! flags therefore assembles the lower layers with [`Config::load_unvalidated`], applies
+//! its flags, and calls [`Config::validate`] itself — otherwise a flag could not rescue a
+//! value the file or environment got wrong, which is exactly what "flags win" promises.
+//! [`Config::load`] is the shorthand for callers with no flags to fold in: the same
+//! layers, validated for you.
 //!
 //! ## Example
 //!
@@ -130,7 +134,36 @@ impl Config {
     /// [`DEFAULT_CONFIG_PATH`] if it happens to exist. A file named explicitly — by
     /// argument or by `RAG_CONFIG` — must exist, because asking for a file that is not
     /// there is a mistake worth reporting rather than silently ignoring.
+    ///
+    /// Use [`Config::load_unvalidated`] when there are CLI flags to apply on top: they
+    /// override these layers, so validation has to wait until they are folded in.
     pub fn load(path: Option<&Path>) -> Result<Self, ConfigError> {
+        let config = Self::load_unvalidated(path)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Assemble a config from defaults, then a file, then the environment, *without*
+    /// validating it.
+    ///
+    /// The layers resolve exactly as in [`Config::load`]; only the final check is left to
+    /// the caller. That is what lets a CLI flag override a value the file or environment
+    /// got wrong: validating the lower layers first would reject a setting the flag was
+    /// about to replace. Call [`Config::validate`] once, after the flags are applied.
+    ///
+    /// ```no_run
+    /// use penr_oz_ai_rag_service::{Config, ConfigError};
+    ///
+    /// # fn main() -> Result<(), ConfigError> {
+    /// // Defaults -> file -> environment, unvalidated.
+    /// let mut config = Config::load_unvalidated(None)?;
+    /// // ...then whatever the command line said, which wins.
+    /// config.retrieval.min_score = 0.25;
+    /// config.validate()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn load_unvalidated(path: Option<&Path>) -> Result<Self, ConfigError> {
         let explicit = path.map(PathBuf::from).or_else(|| {
             std::env::var(CONFIG_PATH_ENV)
                 .ok()
@@ -151,7 +184,6 @@ impl Config {
         };
 
         config.apply_env()?;
-        config.validate()?;
         Ok(config)
     }
 
@@ -230,8 +262,9 @@ impl Config {
 
     /// Reject a config the service could not honour, naming the offending setting.
     ///
-    /// Called by [`Config::load`]; call it again after applying CLI overrides, since
-    /// those bypass the layers that were already checked.
+    /// Meant to run once, over the fully resolved config: [`Config::load`] calls it for
+    /// callers with nothing left to apply, and a binary that layers CLI flags on top of
+    /// [`Config::load_unvalidated`] calls it after applying them.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.addr()?;
 
@@ -260,10 +293,29 @@ impl Config {
 
     /// The address the server should bind, built from `server.host` and `server.port`.
     ///
+    /// A host may carry an IPv6 zone (scope) id — `fe80::1%3` — and it is kept, so a
+    /// link-local address binds the interface that was asked for instead of scope `0`.
+    ///
     /// Returns [`ConfigError::Invalid`] if the host is not an IP address.
+    ///
+    /// ```
+    /// use penr_oz_ai_rag_service::Config;
+    /// use std::net::SocketAddr;
+    ///
+    /// let mut config = Config::default();
+    /// config.server.host = "fe80::1%3".to_string();
+    /// config.server.port = 8080;
+    ///
+    /// match config.addr().unwrap() {
+    ///     SocketAddr::V6(addr) => assert_eq!(addr.scope_id(), 3),
+    ///     other => panic!("expected an IPv6 address, got {other}"),
+    /// }
+    /// ```
     pub fn addr(&self) -> Result<SocketAddr, ConfigError> {
         let text = if self.server.host.contains(':') {
-            // An IPv6 literal needs brackets before a port can be appended to it.
+            // An IPv6 literal needs brackets before a port can be appended to it. The
+            // bracketed form is also what carries a `%<scope>` suffix through parsing:
+            // `Ipv6Addr` alone would reject it.
             format!("[{}]:{}", self.server.host, self.server.port)
         } else {
             format!("{}:{}", self.server.host, self.server.port)
@@ -283,6 +335,9 @@ impl Config {
 pub struct ServerConfig {
     /// IP address to bind. Defaults to loopback, so an unconfigured service is not
     /// exposed to the network by accident.
+    ///
+    /// An IPv6 host may carry a numeric zone (scope) id, as in `fe80::1%3`, which a
+    /// link-local address needs to name the interface it belongs to.
     pub host: String,
     /// Port to bind. `0` picks a free port, which is how tests avoid collisions.
     pub port: u16,
@@ -721,6 +776,22 @@ mod tests {
         config.server.host = "::1".to_string();
         config.server.port = 8080;
         assert_eq!(config.addr().unwrap().to_string(), "[::1]:8080");
+    }
+
+    #[test]
+    fn an_ipv6_zone_id_survives_the_trip_to_a_socket_address() {
+        let mut config = Config::default();
+        config.server.host = "fe80::1%3".to_string();
+        config.server.port = 8080;
+
+        let addr = config.addr().unwrap();
+
+        match addr {
+            SocketAddr::V6(addr) => assert_eq!(addr.scope_id(), 3),
+            other => panic!("expected an IPv6 address, got {other}"),
+        }
+        assert_eq!(addr.to_string(), "[fe80::1%3]:8080");
+        config.validate().unwrap();
     }
 
     #[test]

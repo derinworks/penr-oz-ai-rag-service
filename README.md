@@ -48,6 +48,8 @@ replaced or extended independently:
 - Grounded answer generation over the indexed corpus: retrieval, a confidence gate that
   keeps low-scoring chunks out of the prompt, a pluggable `LlmProvider`, and source
   references on every answer.
+- Layered configuration — defaults, a JSON file, `RAG_*` environment variables, then CLI
+  flags — validated at startup so a misconfigured service fails immediately.
 
 ## Requirements
 
@@ -88,8 +90,9 @@ Options common to both commands:
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--addr <ADDR>` | `127.0.0.1:8080` | Address to bind the HTTP server to (port `0` picks a free port). |
-| `--min-score <F>` | `0` | Minimum similarity score a retrieved chunk must reach to be used as answer context. Requests can override it per call via `min_score`. |
+| `--config <PATH>` | `$RAG_CONFIG`, then `./rag.config.json` | JSON config file. See [Configuration](#configuration). |
+| `--addr <ADDR>` | `server.host`/`server.port` from config (`127.0.0.1:8080`) | Address to bind the HTTP server to (port `0` picks a free port; an IPv6 zone, as in `[fe80::1%3]:8080`, is kept). |
+| `--min-score <F>` | `retrieval.min_score` from config (`0`) | Minimum similarity score a retrieved chunk must reach to be used as answer context. Requests can override it per call via `min_score`. |
 
 ### Examples
 
@@ -115,6 +118,113 @@ When ingesting a **directory**, files whose format has no registered loader are 
 and counted (`skipped`). When ingesting a **single file**, an unsupported format is an
 error, since you asked for that file explicitly. The process exits non-zero on any
 error.
+
+## Configuration
+
+`serve` resolves its settings from four layers, each overriding the one before it:
+
+1. **Built-in defaults** — the service starts with no configuration at all.
+2. **A JSON config file** — `--config <PATH>`, else `$RAG_CONFIG`, else
+   `./rag.config.json` if it exists. Any key may be omitted; what is missing keeps its
+   default. A file you name explicitly must exist; the implicit `./rag.config.json` may
+   not.
+3. **Environment variables** — `RAG_`-prefixed, one per setting. An empty value counts
+   as unset.
+4. **Command-line flags** — the most specific statement of intent, so they win.
+
+The resolved result is validated once — after the flags are folded in, before ingesting
+or binding anything — so a mistake surfaces at startup rather than on the first request,
+and a flag can still rescue a value the file or environment got wrong.
+
+| Config key | Environment variable | Default | Accepted values |
+| --- | --- | --- | --- |
+| `server.host` | `RAG_SERVER_HOST` | `127.0.0.1` | Any IP address (`0.0.0.0`, `::1`, …); an IPv6 host may carry a numeric zone id, as in `fe80::1%3`. |
+| `server.port` | `RAG_SERVER_PORT` | `8080` | `0`–`65535`; `0` picks a free port. |
+| `embedding.provider` | `RAG_EMBEDDING_PROVIDER` | `mock` | `mock` |
+| `llm.provider` | `RAG_LLM_PROVIDER` | `mock` | `mock` |
+| `vector_store.kind` | `RAG_VECTOR_STORE` | `in_memory` | `in_memory` |
+| `logging.level` | `RAG_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
+| `logging.format` | `RAG_LOG_FORMAT` | `text` | `text`, `json` |
+| `retrieval.min_score` | `RAG_RETRIEVAL_MIN_SCORE` | `0` | `-1` to `1` (the range of cosine similarity). |
+| `retrieval.max_query_chars` | `RAG_RETRIEVAL_MAX_QUERY_CHARS` | `8192` | Any positive integer. |
+
+`mock` and `in_memory` are the only backends that exist today; a real provider becomes a
+new variant here once it implements the corresponding trait. There is no `retrieval.top_k`
+setting because `top_k` is chosen per request.
+
+`logging.*` is defined and validated but not yet wired to a subscriber — that arrives with
+tracing and request logging.
+
+```jsonc
+// rag.config.json — every key is optional
+{
+  "server": { "host": "0.0.0.0", "port": 8080 },
+  "embedding": { "provider": "mock" },
+  "llm": { "provider": "mock" },
+  "vector_store": { "kind": "in_memory" },
+  "logging": { "level": "info", "format": "text" },
+  "retrieval": { "min_score": 0.2, "max_query_chars": 8192 }
+}
+```
+
+```bash
+# File, overridden by an environment variable, overridden by a flag
+penr-oz-rag serve ./docs --config rag.config.json
+RAG_SERVER_PORT=9000 penr-oz-rag serve ./docs
+penr-oz-rag serve ./docs --addr 0.0.0.0:9100 --min-score 0.3
+```
+
+Startup echoes what it resolved, so a surprising run can be traced to a layer without
+re-deriving the precedence by hand:
+
+```text
+$ penr-oz-rag serve ./docs --config rag.config.json
+Ingested 2 file(s), skipped 0, created 7 chunk(s).
+  ./docs/intro.txt -> 4 chunk(s)
+  ./docs/notes.txt -> 3 chunk(s)
+Config: embedding=mock, llm=mock, vector_store=in_memory, min_score=0.2, max_query_chars=8192, log=info/text
+Indexed 7 chunk(s) for retrieval.
+Serving POST /retrieve and POST /answer on http://0.0.0.0:8080
+```
+
+Misconfiguration is reported with the offending setting named and the accepted values
+listed, and the process exits non-zero:
+
+```text
+$ RAG_LLM_PROVIDER=gpt-5 penr-oz-rag serve ./docs
+error: environment variable RAG_LLM_PROVIDER=`gpt-5` is not valid: unknown LLM provider `gpt-5`; expected one of: mock
+
+$ penr-oz-rag serve ./docs --min-score 5
+error: invalid configuration: retrieval.min_score must be between -1 and 1 (the range of cosine similarity), got 5
+```
+
+Read the same layers from library code with `Config::load`:
+
+```rust
+use penr_oz_ai_rag_service::{Config, ConfigError};
+
+fn main() -> Result<(), ConfigError> {
+    // Defaults -> file -> environment, then validated.
+    let config = Config::load(None)?;
+    println!("binding {}", config.addr()?);
+    Ok(())
+}
+```
+
+With overrides of your own to fold in, load the lower layers unvalidated, apply them, and
+validate once — the order `serve` itself uses, and what makes overrides win over an
+invalid file or environment value:
+
+```rust
+use penr_oz_ai_rag_service::{Config, ConfigError};
+
+fn main() -> Result<(), ConfigError> {
+    let mut config = Config::load_unvalidated(None)?;
+    config.retrieval.min_score = 0.25; // whatever the command line said
+    config.validate()?;
+    Ok(())
+}
+```
 
 ## Output format
 
@@ -472,6 +582,7 @@ never shown low-confidence context.
 src/
 ├── lib.rs            crate root and re-exports
 ├── main.rs           `penr-oz-rag` CLI (ingest + serve, POST /retrieve + /answer handlers)
+├── config.rs         Config, ConfigError, provider/store/logging kinds
 ├── error.rs          RagError / Result
 ├── document.rs       Document, Chunk, ChunkMetadata
 ├── loader/           Loader trait, LoaderRegistry, TextLoader
@@ -489,7 +600,8 @@ tests/
 ├── vector_search.rs  end-to-end embed-index-retrieve tests
 ├── retrieval.rs      end-to-end retriever tests (validate, embed, search)
 ├── generation.rs     end-to-end answer-generation tests (gate, prompt, attribute)
-└── serve.rs          end-to-end HTTP tests against the served /retrieve + /answer endpoints
+├── serve.rs          end-to-end HTTP tests against the served /retrieve + /answer endpoints
+└── config.rs         config file layer plus the binary booting on what it resolved
 ```
 
 ## License
